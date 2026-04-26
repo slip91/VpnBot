@@ -6,6 +6,7 @@ on:
     paths:
       - 'webapp/**'
       - '.github/workflows/deploy-webapp.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
