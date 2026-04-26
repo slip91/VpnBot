@@ -709,10 +709,41 @@ async def handle_support_ticket(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "ticket_id": ticket_id})
 
 
+# ── CORS middleware ────────────────────────────────────────────────────────────
+
+ALLOWED_ORIGINS = {
+    "https://lemonov911.github.io",
+    "http://localhost:5173",
+    "http://localhost:4173",
+}
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    origin = request.headers.get("Origin", "")
+    allow_origin = origin if origin in ALLOWED_ORIGINS else ""
+
+    # Preflight
+    if request.method == "OPTIONS":
+        return web.Response(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin":  allow_origin or "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, X-Telegram-Init-Data",
+                "Access-Control-Max-Age":       "86400",
+            },
+        )
+
+    response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"]  = allow_origin or "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
+    return response
+
+
 # ── Фабрика приложения ─────────────────────────────────────────────────────────
 
 def create_api_app(bot: Bot) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app["bot"] = bot
 
     # VPN
