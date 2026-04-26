@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { HashRouter, Routes, Route } from 'react-router-dom'
 import WebApp from '@twa-dev/sdk'
 import { LanguageProvider } from './i18n'
 import BottomNav from './components/BottomNav'
@@ -23,7 +23,7 @@ export default function App() {
 
   return (
     <LanguageProvider>
-      <BrowserRouter>
+      <HashRouter>
         <Routes>
           {/* VPN */}
           <Route path="/vpn"          element={<VPN />} />
@@ -44,7 +44,7 @@ export default function App() {
           <Route path="/"             element={<Home />} />
         </Routes>
         <BottomNav />
-      </BrowserRouter>
+      </HashRouter>
     </LanguageProvider>
   )
 }
