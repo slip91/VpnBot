@@ -1,0 +1,93 @@
+import os
+from aiogram import Router
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    WebAppInfo,
+)
+
+from config import ADMIN_ID
+from services.database import upsert_user, set_referred_by, get_referral_stats, add_referral_bonus
+
+router = Router()
+
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
+REFERRAL_BONUS_DAYS = 7  # дней бонуса рефереру за первую покупку реферала
+
+
+def _main_menu(start_param: str = "") -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    if WEBAPP_URL:
+        url = WEBAPP_URL
+        # Deep link: открываем нужный раздел через startapp param
+        if start_param.startswith("plan_"):
+            url = f"{WEBAPP_URL}/vpn/plans"
+        elif start_param == "esim":
+            url = f"{WEBAPP_URL}/esim"
+        elif start_param == "support":
+            url = f"{WEBAPP_URL}/support"
+
+        buttons.append([
+            InlineKeyboardButton(
+                text="🚀 Открыть приложение",
+                web_app=WebAppInfo(url=url),
+            )
+        ])
+    else:
+        buttons.append([InlineKeyboardButton(text="🌐 VPN",  callback_data="menu:vpn")])
+        buttons.append([InlineKeyboardButton(text="📱 eSIM", callback_data="menu:esim")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id    = message.from_user.id
+    username   = message.from_user.username
+    first_name = message.from_user.first_name
+
+    await upsert_user(user_id=user_id, username=username, first_name=first_name)
+
+    # Парсим start param: /start ref_123456789  или  /start plan_vpn_popular
+    args = message.text.split(maxsplit=1)
+    start_param = args[1].strip() if len(args) > 1 else ""
+
+    if start_param.startswith("ref_"):
+        try:
+            referrer_id = int(start_param[4:])
+            if referrer_id != user_id:
+                await set_referred_by(user_id, referrer_id)
+        except ValueError:
+            pass
+
+    if WEBAPP_URL:
+        text = "👋 Привет! Нажми кнопку ниже, чтобы открыть магазин VPN & eSIM."
+    else:
+        text = (
+            "👋 Привет! Я помогу тебе получить доступ к интернету без ограничений.\n\n"
+            "Выбери, что тебя интересует:"
+        )
+
+    await message.answer(text, reply_markup=_main_menu(start_param))
+
+
+@router.message(lambda m: m.text and m.text.strip() == "/referral")
+async def cmd_referral(message: Message):
+    """Показывает реферальную ссылку и статистику."""
+    user_id = message.from_user.id
+    bot_info = await message.bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+    stats = await get_referral_stats(user_id)
+
+    await message.answer(
+        "🔗 <b>Реферальная программа</b>\n\n"
+        f"Приглашай друзей — за каждого, кто купит VPN, получаешь <b>+{REFERRAL_BONUS_DAYS} дней</b> бесплатно.\n\n"
+        f"Твоя ссылка:\n<code>{ref_link}</code>\n\n"
+        f"👥 Приглашено: <b>{stats['invited']}</b>\n"
+        f"💳 Купили: <b>{stats['converted']}</b>\n"
+        f"🎁 Бонусных дней получено: <b>{stats['bonus_days']}</b>",
+        parse_mode="HTML",
+    )

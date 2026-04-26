@@ -1,0 +1,562 @@
+"""
+SQLite через aiosqlite.
+
+Жизненный цикл слота конфига:
+  empty   → куплен, конфиг не создан
+  active  → конфиг создан, работает
+  (revoked удалён — отзыв сбрасывает слот в empty, слот не исчезает)
+"""
+
+import aiosqlite
+from datetime import datetime
+from pathlib import Path
+
+DB_PATH = Path(__file__).parent.parent / "bot.db"
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id         INTEGER PRIMARY KEY,
+                username   TEXT,
+                first_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                product_type TEXT    NOT NULL,
+                plan         TEXT    NOT NULL,
+                stars_paid   INTEGER NOT NULL,
+                payment_id   TEXT,
+                status       TEXT DEFAULT 'pending',
+                vpn_username TEXT,
+                expires_at   TIMESTAMP,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS servers (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL DEFAULT 'Сервер',
+                location   TEXT NOT NULL DEFAULT '🌍',
+                host       TEXT NOT NULL,
+                user       TEXT NOT NULL DEFAULT 'root',
+                password   TEXT,
+                key_path   TEXT,
+                protocol   TEXT NOT NULL DEFAULT 'awg',
+                is_active  INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                plan       TEXT NOT NULL,
+                payment_id TEXT UNIQUE,
+                stars_paid INTEGER NOT NULL DEFAULT 0,
+                status     TEXT NOT NULL DEFAULT 'active',
+                expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS configs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                subscription_id INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                server_id       INTEGER,
+                protocol        TEXT NOT NULL DEFAULT 'awg',
+                peer_name       TEXT,
+                config_data     TEXT,
+                vless_uuid      TEXT,
+                status          TEXT NOT NULL DEFAULT 'empty',
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
+                FOREIGN KEY (server_id) REFERENCES servers(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                category   TEXT NOT NULL,
+                message    TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await _migrate(db)
+        await db.commit()
+
+    # Автозаполнение дефолтного сервера из env если таблица пустая
+    await _seed_default_server()
+
+
+async def _migrate(db: aiosqlite.Connection):
+    """Добавляет новые колонки в существующие таблицы."""
+    # orders
+    async with db.execute("PRAGMA table_info(orders)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    for col, defn in [("vpn_username", "TEXT"), ("expires_at", "TIMESTAMP")]:
+        if col not in cols:
+            await db.execute(f"ALTER TABLE orders ADD COLUMN {col} {defn}")
+
+    # servers — добавляем name/location если их нет (для старых БД)
+    async with db.execute("PRAGMA table_info(servers)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    for col, defn in [("name", "TEXT NOT NULL DEFAULT 'Сервер'"),
+                      ("location", "TEXT NOT NULL DEFAULT '🌍'")]:
+        if col not in cols:
+            await db.execute(f"ALTER TABLE servers ADD COLUMN {col} {defn}")
+
+    # subscriptions — pending_plan, expiry reminders
+    async with db.execute("PRAGMA table_info(subscriptions)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    if "pending_plan" not in cols:
+        await db.execute("ALTER TABLE subscriptions ADD COLUMN pending_plan TEXT")
+    if "reminded_3d" not in cols:
+        await db.execute("ALTER TABLE subscriptions ADD COLUMN reminded_3d INTEGER NOT NULL DEFAULT 0")
+    if "reminded_1d" not in cols:
+        await db.execute("ALTER TABLE subscriptions ADD COLUMN reminded_1d INTEGER NOT NULL DEFAULT 0")
+
+    # support_tickets — admin_msg_id for reply relay
+    async with db.execute("PRAGMA table_info(support_tickets)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    if "admin_msg_id" not in cols:
+        await db.execute("ALTER TABLE support_tickets ADD COLUMN admin_msg_id INTEGER")
+
+    # users — referral tracking
+    async with db.execute("PRAGMA table_info(users)") as cur:
+        cols = {row[1] for row in await cur.fetchall()}
+    if "referred_by" not in cols:
+        await db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+    if "ref_bonus_days" not in cols:
+        await db.execute("ALTER TABLE users ADD COLUMN ref_bonus_days INTEGER NOT NULL DEFAULT 0")
+
+
+async def _seed_default_server():
+    """Если серверов нет — добавляет дефолтный из переменных окружения."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM servers") as cur:
+            count = (await cur.fetchone())[0]
+        if count > 0:
+            return
+        from config import VPN_SERVER_HOST, VPN_SERVER_USER, VPN_SERVER_PASS, VPN_SERVER_KEY
+        if VPN_SERVER_HOST:
+            await db.execute(
+                """INSERT INTO servers (name, location, host, user, password, key_path, protocol)
+                   VALUES (?, ?, ?, ?, ?, ?, 'awg')""",
+                ("США #1", "🇺🇸 США", VPN_SERVER_HOST,
+                 VPN_SERVER_USER, VPN_SERVER_PASS or None, VPN_SERVER_KEY or None),
+            )
+            await db.commit()
+
+
+# ── users ──────────────────────────────────────────────────────────────────────
+
+async def upsert_user(user_id: int, username: str | None, first_name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (id, username, first_name) VALUES (?, ?, ?)",
+            (user_id, username, first_name),
+        )
+        await db.commit()
+
+
+# ── orders ─────────────────────────────────────────────────────────────────────
+
+async def create_order(user_id, product_type, plan, stars_paid,
+                       vpn_username=None, expires_at=None) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO orders (user_id, product_type, plan, stars_paid, vpn_username, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, product_type, plan, stars_paid, vpn_username,
+             expires_at.isoformat() if expires_at else None),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def complete_order(order_id: int, payment_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE orders SET status='completed', payment_id=? WHERE id=?",
+            (payment_id, order_id),
+        )
+        await db.commit()
+
+
+async def get_expired_orders() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, user_id, vpn_username FROM orders
+            WHERE product_type='vpn' AND status='completed'
+              AND expires_at IS NOT NULL AND expires_at <= ?
+        """, (datetime.utcnow().isoformat(),)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_order_expired(order_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE orders SET status='expired' WHERE id=?", (order_id,))
+        await db.commit()
+
+
+async def get_stats() -> tuple[int, int, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            users = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM orders WHERE status IN ('completed','expired')"
+        ) as cur:
+            orders = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COALESCE(SUM(stars_paid),0) FROM orders WHERE status IN ('completed','expired')"
+        ) as cur:
+            stars = (await cur.fetchone())[0]
+    return users, orders, stars
+
+
+# ── servers ────────────────────────────────────────────────────────────────────
+
+async def get_servers_by_protocol(protocol: str) -> list[dict]:
+    """Активные серверы для протокола (AWG или VLESS)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, name, location, host, user, password, key_path FROM servers "
+            "WHERE protocol=? AND is_active=1 ORDER BY id",
+            (protocol,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_server_by_id(server_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM servers WHERE id=?", (server_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+# ── subscriptions ──────────────────────────────────────────────────────────────
+
+async def create_subscription(user_id, plan, payment_id, stars_paid, expires_at) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO subscriptions (user_id, plan, payment_id, stars_paid, expires_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (user_id, plan, payment_id, stars_paid, expires_at.isoformat()),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_subscription_by_payment_id(payment_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM subscriptions WHERE payment_id=?", (payment_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_expired_subscriptions() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, user_id, plan FROM subscriptions
+            WHERE status='active' AND expires_at IS NOT NULL AND expires_at <= ?
+        """, (datetime.utcnow().isoformat(),)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_subscription_expired(subscription_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET status='expired' WHERE id=?", (subscription_id,)
+        )
+        await db.commit()
+
+
+# ── configs / slots ────────────────────────────────────────────────────────────
+
+async def create_config_record(subscription_id, user_id,
+                                protocol="awg", server_id=None) -> int:
+    """Создаёт пустой слот. Возвращает id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO configs (subscription_id, user_id, protocol, server_id, status)
+               VALUES (?, ?, ?, ?, 'empty')""",
+            (subscription_id, user_id, protocol, server_id),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def activate_config_slot(config_id: int, peer_name: str,
+                                config_data: str, server_id: int | None = None):
+    """Переводит слот empty → active, записывает конфиг и сервер."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE configs
+               SET peer_name=?, config_data=?, server_id=?, status='active'
+               WHERE id=?""",
+            (peer_name, config_data, server_id, config_id),
+        )
+        await db.commit()
+
+
+async def reset_config_slot(config_id: int):
+    """
+    Сбрасывает слот обратно в empty после отзыва конфига.
+    Слот остаётся в подписке — пользователь может добавить новый конфиг.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE configs
+               SET status='empty', peer_name=NULL, config_data=NULL,
+                   server_id=NULL, vless_uuid=NULL
+               WHERE id=?""",
+            (config_id,),
+        )
+        await db.commit()
+
+
+async def update_config_peer(config_id: int, peer_name: str, config_data: str | None):
+    """Legacy — используй activate_config_slot."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        status = 'active' if config_data else 'empty'
+        await db.execute(
+            "UPDATE configs SET peer_name=?, config_data=?, status=? WHERE id=?",
+            (peer_name, config_data, status, config_id),
+        )
+        await db.commit()
+
+
+async def get_user_configs(user_id: int) -> list[dict]:
+    """Все слоты пользователя (empty + active) по активным подпискам."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT
+                c.id,
+                c.subscription_id,
+                c.protocol,
+                c.peer_name,
+                c.status,
+                c.config_data IS NOT NULL AS has_config,
+                s.plan,
+                s.expires_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY c.subscription_id, c.protocol
+                    ORDER BY c.id
+                ) AS slot_num
+            FROM configs c
+            JOIN subscriptions s ON c.subscription_id = s.id
+            WHERE c.user_id=?
+              AND c.status IN ('empty','active')
+              AND s.status='active'
+            ORDER BY s.created_at DESC, c.protocol DESC, c.id ASC
+        """, (user_id,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_configs_for_subscription(subscription_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, peer_name, protocol, server_id FROM configs "
+            "WHERE subscription_id=? AND status='active'",
+            (subscription_id,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_config_by_id(config_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM configs WHERE id=?", (config_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def revoke_config(config_id: int):
+    """Legacy alias — теперь просто сбрасывает в empty."""
+    await reset_config_slot(config_id)
+
+
+async def get_active_subscription(user_id: int) -> dict | None:
+    """Возвращает активную подписку пользователя или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT id, plan, stars_paid, status, expires_at, pending_plan, created_at
+            FROM subscriptions
+            WHERE user_id=? AND status='active'
+            ORDER BY created_at DESC LIMIT 1
+        """, (user_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def change_subscription_plan(sub_id: int, new_plan: str, user_id: int,
+                                    awg_delta: int, vless_delta: int):
+    """
+    Немедленно меняет план подписки (апгрейд).
+    Добавляет новые пустые слоты если awg_delta/vless_delta > 0.
+    Снимает pending_plan если он был.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET plan=?, pending_plan=NULL WHERE id=?",
+            (new_plan, sub_id),
+        )
+        for _ in range(max(0, awg_delta)):
+            await db.execute(
+                "INSERT INTO configs (subscription_id, user_id, protocol, status) "
+                "VALUES (?, ?, 'awg', 'empty')",
+                (sub_id, user_id),
+            )
+        for _ in range(max(0, vless_delta)):
+            await db.execute(
+                "INSERT INTO configs (subscription_id, user_id, protocol, status) "
+                "VALUES (?, ?, 'vless', 'empty')",
+                (sub_id, user_id),
+            )
+        await db.commit()
+
+
+async def schedule_plan_change(sub_id: int, pending_plan: str | None):
+    """
+    Ставит (или снимает) запланированный даунгрейд на следующий месяц.
+    pending_plan=None — отменить запланированное изменение.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET pending_plan=? WHERE id=?",
+            (pending_plan, sub_id),
+        )
+        await db.commit()
+
+
+async def has_active_subscription(user_id: int) -> bool:
+    """True если у пользователя есть активная подписка."""
+    sub = await get_active_subscription(user_id)
+    return sub is not None
+
+
+# ── support_tickets ────────────────────────────────────────────────────────────
+
+async def create_support_ticket(user_id: int, category: str, message: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO support_tickets (user_id, category, message) VALUES (?, ?, ?)",
+            (user_id, category, message),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def update_ticket_admin_msg(ticket_id: int, admin_msg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE support_tickets SET admin_msg_id=? WHERE id=?",
+            (admin_msg_id, ticket_id),
+        )
+        await db.commit()
+
+
+async def get_ticket_by_admin_msg(admin_msg_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM support_tickets WHERE admin_msg_id=?", (admin_msg_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+# ── expiry reminders ───────────────────────────────────────────────────────────
+
+async def get_subscriptions_expiring_soon(days: int) -> list[dict]:
+    """Возвращает активные подписки, истекающие через `days` дней (±12 ч)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        col = "reminded_3d" if days >= 2 else "reminded_1d"
+        async with db.execute(
+            f"""SELECT * FROM subscriptions
+                WHERE status='active'
+                AND {col}=0
+                AND expires_at > datetime('now', '+{days-1} days')
+                AND expires_at < datetime('now', '+{days} days')""",
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_reminded(sub_id: int, days: int):
+    col = "reminded_3d" if days >= 2 else "reminded_1d"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE subscriptions SET {col}=1 WHERE id=?", (sub_id,))
+        await db.commit()
+
+
+# ── referrals ─────────────────────────────────────────────────────────────────
+
+async def set_referred_by(user_id: int, referrer_id: int):
+    """Записывает реферера только если у пользователя его ещё нет."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET referred_by=? WHERE id=? AND referred_by IS NULL",
+            (referrer_id, user_id),
+        )
+        await db.commit()
+
+
+async def get_referral_stats(referrer_id: int) -> dict:
+    """Сколько пользователей привёл реферер и сколько из них купили."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE referred_by=?", (referrer_id,)
+        ) as cur:
+            invited = (await cur.fetchone())[0]
+        async with db.execute(
+            """SELECT COUNT(DISTINCT u.id) FROM users u
+               JOIN subscriptions s ON s.user_id=u.id
+               WHERE u.referred_by=? AND s.status IN ('active','expired')""",
+            (referrer_id,),
+        ) as cur:
+            converted = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT ref_bonus_days FROM users WHERE id=?", (referrer_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            bonus_days = row[0] if row else 0
+    return {"invited": invited, "converted": converted, "bonus_days": bonus_days}
+
+
+async def add_referral_bonus(referrer_id: int, days: int):
+    """Начисляет дни бонуса рефереру и продлевает активную подписку."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET ref_bonus_days=ref_bonus_days+? WHERE id=?",
+            (days, referrer_id),
+        )
+        await db.execute(
+            """UPDATE subscriptions
+               SET expires_at=datetime(expires_at, '+? days')
+               WHERE user_id=? AND status='active'""",
+            (days, referrer_id),
+        )
+        await db.commit()

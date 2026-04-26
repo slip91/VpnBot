@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Bot secrets & DB
+.env
+bot/.env
+bot/*.db
+bot/bot.db
+
+# Webapp secrets & build
+webapp/.env
+webapp/dist/
+webapp/node_modules/
+
+# Misc
+.idea/
+.DS_Store
+*.log
