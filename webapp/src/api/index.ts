@@ -1,5 +1,7 @@
 import WebApp from '@twa-dev/sdk'
 
+const API_BASE = import.meta.env.VITE_API_URL ?? ''
+
 // ── Базовые хелперы ───────────────────────────────────────────────────────────
 
 /**
@@ -15,7 +17,7 @@ function authHeaders(): Record<string, string> {
 }
 
 async function post<T>(path: string, body: object): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(API_BASE + path, {
     method: 'POST',
     headers: authHeaders(),
     // init_data в теле — для backward compatibility
@@ -27,7 +29,7 @@ async function post<T>(path: string, body: object): Promise<T> {
 }
 
 async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
-  const url = new URL(path, window.location.origin)
+  const url = new URL(API_BASE + path, window.location.origin)
   if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v))
   const res = await fetch(url.toString(), { headers: authHeaders() })
   const data = await res.json()
