@@ -38,7 +38,7 @@ function ExpiryRing({ days }: { days: number }) {
 function AppLogo() {
   return (
     <img
-      src="/logo.png"
+      src={import.meta.env.BASE_URL + 'logo.png'}
       alt="MAX"
       style={{ width: 42, height: 42, borderRadius: 12, flexShrink: 0, objectFit: 'cover' }}
     />
